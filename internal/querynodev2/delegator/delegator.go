@@ -52,6 +52,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/conc"
@@ -326,6 +327,50 @@ func (sd *shardDelegator) executeSearchSubTasks(
 	return results, nil
 }
 
+// extractFilterExpr extracts the filter expression from a PlanNode.
+func extractFilterExpr(plan *planpb.PlanNode) *planpb.Expr {
+	if vn := plan.GetVectorAnns(); vn != nil {
+		return vn.GetPredicates()
+	}
+	return nil
+}
+
+// makeAdaptiveModifySearchRequest returns a modify function that injects per-segment
+// iterative-filter hints into the SerializedExprPlan when all segments in the batch
+// have been advised to use iterative filter.
+func (sd *shardDelegator) makeAdaptiveModifySearchRequest(
+	origReq *querypb.SearchRequest,
+	advisedHints AdvisedHints,
+) func(*querypb.SearchRequest, querypb.DataScope, []int64, int64) *querypb.SearchRequest {
+	// Pre-serialize the iterative-filter variant of the plan once.
+	var iterativePlan []byte
+	plan := &planpb.PlanNode{}
+	if proto.Unmarshal(origReq.GetReq().GetSerializedExprPlan(), plan) == nil {
+		if vn := plan.GetVectorAnns(); vn != nil && vn.GetQueryInfo() != nil {
+			vn.QueryInfo.Hints = HintIterativeFilter
+			if b, err := proto.Marshal(plan); err == nil {
+				iterativePlan = b
+			}
+		}
+	}
+
+	return func(req *querypb.SearchRequest, scope querypb.DataScope, segmentIDs []int64, targetID int64) *querypb.SearchRequest {
+		nodeReq := sd.modifySearchRequest(req, scope, segmentIDs, targetID)
+		// Only override for sealed (historical) segments; growing segments fall back to default.
+		if scope != querypb.DataScope_Historical || iterativePlan == nil {
+			return nodeReq
+		}
+		// Use iterative filter only when ALL segments in this batch are advised to do so.
+		for _, segID := range segmentIDs {
+			if advisedHints[segID] != HintIterativeFilter {
+				return nodeReq
+			}
+		}
+		nodeReq.Req.SerializedExprPlan = iterativePlan
+		return nodeReq
+	}
+}
+
 // Search preforms search operation on shard.
 func (sd *shardDelegator) search(ctx context.Context, req *querypb.SearchRequest, sealed []SnapshotItem, growing []SegmentEntry, sealedRowCount map[int64]int64) ([]*internalpb.SearchResults, error) {
 	log := sd.getLogger(ctx)
@@ -342,14 +387,24 @@ func (sd *shardDelegator) search(ctx context.Context, req *querypb.SearchRequest
 		}()
 	}
 
-	if paramtable.Get().QueryNodeCfg.EnableSegmentFilter.GetAsBool() {
-		PruneSealedSegmentsByPKFilter(ctx,
-			req.GetReq().GetSerializedExprPlan(),
-			req.GetReq().GetPkFilter(),
-			sealed,
-			req.GetReq().GetCollectionID(),
-			metrics.SearchLabel,
-		)
+	// Compute per-segment filter strategy hints when the adaptive strategy is enabled
+	// and the user has not already supplied an explicit hints override.
+	var advisedHints AdvisedHints
+	if paramtable.Get().QueryNodeCfg.EnableAdaptiveFilterStrategy.GetAsBool() &&
+		req.GetReq().GetSerializedExprPlan() != nil {
+		func() {
+			sd.partitionStatsMut.RLock()
+			defer sd.partitionStatsMut.RUnlock()
+			plan := &planpb.PlanNode{}
+			if err := proto.Unmarshal(req.GetReq().GetSerializedExprPlan(), plan); err == nil {
+				exprPb := extractFilterExpr(plan)
+				if exprPb != nil {
+					threshold := paramtable.Get().QueryNodeCfg.AdaptiveFilterStrategyThreshold.GetAsFloat()
+					advisedHints = AdviseFilterStrategy(exprPb, sd.partitionStats, sealed, threshold)
+				}
+			}
+		}()
+	}
 	}
 
 	if sd.functionFieldType[req.GetReq().GetFieldId()] == schemapb.FunctionType_BM25 {

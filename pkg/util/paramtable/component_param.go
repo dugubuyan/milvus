@@ -3624,20 +3624,10 @@ type queryNodeConfig struct {
 	ExternalCollectionSamplePerSegment ParamItem `refreshable:"true"`
 	ExternalCollectionSampleRows       ParamItem `refreshable:"true"`
 	ExternalCollectionRawDataFactor    ParamItem `refreshable:"true"`
-}
 
-func formatDurationWithMillisecondFallback(v string) string {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return v
-	}
-	if _, err := time.ParseDuration(v); err == nil {
-		return v
-	}
-	if _, err := strconv.ParseFloat(v, 64); err == nil {
-		return v + "ms"
-	}
-	return v
+	// adaptive filter strategy
+	EnableAdaptiveFilterStrategy    ParamItem `refreshable:"true"`
+	AdaptiveFilterStrategyThreshold ParamItem `refreshable:"true"`
 }
 
 func (p *queryNodeConfig) init(base *BaseTable) {
@@ -4907,6 +4897,24 @@ user-task-polling:
 	}
 	p.PartialResultRequiredDataRatio.Init(base.mgr)
 
+	p.EnableAdaptiveFilterStrategy = ParamItem{
+		Key:          "queryNode.adaptiveFilterStrategy.enabled",
+		Version:      "2.6.0",
+		DefaultValue: "true",
+		Doc:          "enable cost-based adaptive selection between pre-filter and iterative-filter per segment",
+		Export:       true,
+	}
+	p.EnableAdaptiveFilterStrategy.Init(base.mgr)
+
+	p.AdaptiveFilterStrategyThreshold = ParamItem{
+		Key:          "queryNode.adaptiveFilterStrategy.threshold",
+		Version:      "2.6.0",
+		DefaultValue: "0.5",
+		Doc:          "selectivity threshold above which iterative filter is preferred over pre-filter (0.0–1.0)",
+		Export:       true,
+	}
+	p.AdaptiveFilterStrategyThreshold.Init(base.mgr)
+
 	p.InternalCollectionUseTakeForOutput = ParamItem{
 		Key:          "queryNode.internalCollection.useTakeForOutput",
 		Version:      "3.0.0",
@@ -4951,6 +4959,20 @@ user-task-polling:
 		Export:       false,
 	}
 	p.ExternalCollectionRawDataFactor.Init(base.mgr)
+}
+
+func formatDurationWithMillisecondFallback(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return v
+	}
+	if _, err := time.ParseDuration(v); err == nil {
+		return v
+	}
+	if _, err := strconv.ParseFloat(v, 64); err == nil {
+		return v + "ms"
+	}
+	return v
 }
 
 // /////////////////////////////////////////////////////////////////////////////
